@@ -19,7 +19,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "bun x tsc -p tsconfig.json",
     "serve": "bun ./src/cli.ts",
     "test": "bun test src/*.test.ts"
   },
