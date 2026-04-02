@@ -1,0 +1,40 @@
+{
+  "name": "transapi-forwarder",
+  "version": "0.1.0",
+  "description": "Config-driven universal AI API forwarding layer with Claude/OpenAI/Codex/Gemini format conversion",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "transapi-forwarder": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "serve": "bun ./src/cli.ts",
+    "test": "bun test ./src/**/*.test.ts"
+  },
+  "keywords": [
+    "proxy",
+    "forwarder",
+    "claude",
+    "openai",
+    "codex",
+    "gemini",
+    "yaml"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
