@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "serve": "bun ./src/cli.ts",
-    "test": "bun test ./src/**/*.test.ts"
+    "test": "bun test src/*.test.ts"
   },
   "keywords": [
     "proxy",
