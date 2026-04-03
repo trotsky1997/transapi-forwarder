@@ -335,14 +335,13 @@ describe("normalizeRequest", () => {
         service_tier: "priority",
         truncation: "disabled",
         store: true,
+        tool_choice: { type: "function", name: "Read" },
         tools: [
           {
             type: "function",
-            function: {
-              name: "Read",
-              parameters: { type: "object" },
-              strict: true,
-            },
+            name: "Read",
+            parameters: { type: "object" },
+            strict: true,
           },
         ],
         context_management: [{ type: "compaction", compact_threshold: 200000 }],
@@ -357,6 +356,7 @@ describe("normalizeRequest", () => {
     expect(normalized.serviceTier).toBe("priority");
     expect(normalized.truncation).toBe("disabled");
     expect(normalized.store).toBe(true);
+    expect(normalized.toolChoice).toEqual({ type: "tool", name: "Read" });
     expect(normalized.compaction).toEqual({ triggerTokens: 200000 });
     expect(normalized.tools).toEqual([
       {
@@ -376,15 +376,14 @@ describe("normalizeRequest", () => {
       service_tier: "priority",
       truncation: "disabled",
       store: true,
+      tool_choice: { type: "function", name: "Read" },
       context_management: [{ type: "compaction", compact_threshold: 200000 }],
       tools: [
         {
           type: "function",
-          function: {
-            name: "Read",
-            parameters: { type: "object" },
-            strict: true,
-          },
+          name: "Read",
+          parameters: { type: "object" },
+          strict: true,
         },
       ],
     });
@@ -546,6 +545,11 @@ describe("normalizeRequest", () => {
       tools: [{ type: "web_search_20250305", name: "web_search", search_context_size: "medium" }],
       tool_choice: { type: "web_search_20250305", name: "web_search" },
     });
+
+    expect(renderRequest("response", normalized)).toMatchObject({
+      tools: [{ type: "web_search", search_context_size: "medium" }],
+      tool_choice: { type: "web_search" },
+    });
   });
 
   test("maps additional built-in tools between openai and claude families", () => {
@@ -589,6 +593,22 @@ describe("normalizeRequest", () => {
           name: "computer",
           display_width_px: 1024,
           display_height_px: 768,
+        },
+      ],
+    });
+
+    expect(renderRequest("response", normalized)).toMatchObject({
+      tools: [
+        { type: "code_interpreter" },
+        { type: "image_generation" },
+        { type: "file_search" },
+        {
+          type: "function",
+          name: "computer",
+          parameters: {
+            type: "object",
+            required: ["action"],
+          },
         },
       ],
     });
@@ -710,6 +730,48 @@ describe("normalizeRequest", () => {
         }),
       ])
     );
+  });
+
+  test("captures built-in response output items that expose action objects instead of arguments", () => {
+    const normalized = normalizeResponse("response", {
+      id: "resp_builtin_action",
+      model: "gpt-5.4",
+      status: "completed",
+      output: [
+        {
+          id: "ws_2",
+          type: "web_search_call",
+          action: {
+            type: "search",
+            query: "official Anthropic website",
+            queries: ["official Anthropic website"],
+          },
+        },
+      ],
+    });
+
+    expect(normalized.toolCalls).toEqual([
+      {
+        type: "tool-call",
+        id: "ws_2",
+        name: "web_search",
+        arguments: {
+          type: "search",
+          query: "official Anthropic website",
+          queries: ["official Anthropic website"],
+        },
+        toolType: "web_search",
+        raw: {
+          id: "ws_2",
+          type: "web_search_call",
+          action: {
+            type: "search",
+            query: "official Anthropic website",
+            queries: ["official Anthropic website"],
+          },
+        },
+      },
+    ]);
   });
 
   test("captures built-in response output items such as computer_call", () => {

@@ -423,7 +423,8 @@ function normalizeToolChoice(value: unknown): ToolChoice | undefined {
     return { type: "tool", name: record.name };
   }
   if (record.type === "function") {
-    const functionRecord = asRecord(record.function);
+    const nestedFunctionRecord = asRecord(record.function);
+    const functionRecord = Object.keys(nestedFunctionRecord).length > 0 ? nestedFunctionRecord : record;
     if (typeof functionRecord.name === "string") {
       return { type: "tool", name: functionRecord.name };
     }
@@ -547,7 +548,11 @@ function normalizeToolList(value: unknown): NormalizedTool[] | undefined {
       });
       continue;
     }
-    const functionRecord = record.type === "function" ? asRecord(record.function) : record;
+    const nestedFunctionRecord = asRecord(record.function);
+    const functionRecord =
+      record.type === "function" && Object.keys(nestedFunctionRecord).length > 0
+        ? nestedFunctionRecord
+        : record;
     const name = asString(functionRecord.name);
     if (!name) continue;
 
@@ -589,6 +594,79 @@ function renderOpenAITools(value: NormalizedTool[] | undefined): unknown {
       },
     };
   });
+}
+
+function renderResponseTools(value: NormalizedTool[] | undefined): unknown {
+  if (!value || value.length === 0) return undefined;
+  return value.map((tool) => {
+    const toolType = tool.toolType ?? tool.name;
+    if (tool.kind === "builtin" || tool.toolType) {
+      if (toolType === "web_search") {
+        return {
+          type: "web_search",
+          ...(tool.raw?.search_context_size ? { search_context_size: tool.raw.search_context_size } : {}),
+        };
+      }
+
+      if (toolType === "computer") {
+        return {
+          type: "function",
+          name: "computer",
+          description:
+            "Control the computer. Use action=screenshot to capture the screen, or other actions to click, move, type, press keys, drag, or scroll.",
+          parameters: {
+            type: "object",
+            properties: {
+              action: { type: "string" },
+              coordinate: {
+                type: "array",
+                items: { type: "number" },
+              },
+              start_coordinate: {
+                type: "array",
+                items: { type: "number" },
+              },
+              text: { type: "string" },
+              key: { type: "string" },
+              scroll_amount: { type: "number" },
+              duration_ms: { type: "number" },
+            },
+            required: ["action"],
+          },
+        };
+      }
+
+      return renderOpenAIBuiltInTool(tool);
+    }
+    return {
+      type: "function",
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      ...(tool.inputSchema ? { parameters: tool.inputSchema } : {}),
+      ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+    };
+  });
+}
+
+function renderResponseToolChoice(value: ToolChoice | undefined): unknown {
+  if (!value || value.type === "auto") return "auto";
+  if (value.type === "any") return "required";
+  if (value.type === "none") return "none";
+  if (value.type === "builtin") {
+    if (value.toolType === "web_search") {
+      return {
+        type: "web_search",
+        ...(value.raw?.search_context_size ? { search_context_size: value.raw.search_context_size } : {}),
+      };
+    }
+
+    if (value.toolType === "computer") {
+      return { type: "function", name: "computer" };
+    }
+
+    return renderOpenAIBuiltInToolChoice(value.toolType, value.raw);
+  }
+  return { type: "function", name: value.name };
 }
 
 function renderClaudeTools(value: NormalizedTool[] | undefined): unknown {
@@ -1593,8 +1671,8 @@ export function renderRequest(format: ApiFormat, request: NormalizedRequest): Re
           : {}),
         ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
         ...(request.topP !== undefined ? { top_p: request.topP } : {}),
-        ...(request.tools ? { tools: renderOpenAITools(request.tools) } : {}),
-        ...(request.toolChoice ? { tool_choice: renderOpenAIToolChoice(request.toolChoice) } : {}),
+        ...(request.tools ? { tools: renderResponseTools(request.tools) } : {}),
+        ...(request.toolChoice ? { tool_choice: renderResponseToolChoice(request.toolChoice) } : {}),
         ...(request.metadata ? { metadata: request.metadata } : {}),
         ...(request.user ? { user: request.user } : {}),
         ...(request.parallelToolCalls !== undefined
@@ -1741,6 +1819,94 @@ function parseSseEvents(raw: string): Array<{ event: string | null; data: string
   return events;
 }
 
+function parseOpenAIPayloadFromString(raw: string): Record<string, unknown> {
+  const events = parseSseEvents(raw);
+  let id = `chatcmpl_${Date.now()}`;
+  let model = "";
+  let text = "";
+  let finishReason: string | null = null;
+  let usage: Record<string, unknown> | undefined;
+  const toolIdsByIndex = new Map<number, string>();
+  const toolNamesByIndex = new Map<number, string>();
+  const toolArgsByIndex = new Map<number, string>();
+
+  for (const event of events) {
+    if (!event.data || event.data === "[DONE]") {
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.data);
+    } catch {
+      continue;
+    }
+
+    const record = asRecord(parsed);
+    id = asString(record.id) ?? id;
+    model = asString(record.model) ?? model;
+
+    const choice = asRecord(asArray(record.choices)[0]);
+    const delta = asRecord(choice.delta);
+
+    text += asString(delta.content) ?? "";
+
+    for (const toolCall of asArray(delta.tool_calls)) {
+      const toolRecord = asRecord(toolCall);
+      const index = asNumber(toolRecord.index) ?? 0;
+      const functionRecord = asRecord(toolRecord.function);
+      const idValue = asString(toolRecord.id) ?? toolIdsByIndex.get(index) ?? `call_${index}`;
+      const nameValue = asString(functionRecord.name) ?? toolNamesByIndex.get(index) ?? `tool_${index}`;
+
+      toolIdsByIndex.set(index, idValue);
+      toolNamesByIndex.set(index, nameValue);
+
+      const argumentsDelta = asString(functionRecord.arguments);
+      if (argumentsDelta) {
+        toolArgsByIndex.set(index, `${toolArgsByIndex.get(index) ?? ""}${argumentsDelta}`);
+      }
+    }
+
+    if (choice.finish_reason !== undefined) {
+      finishReason = asString(choice.finish_reason) ?? finishReason;
+    }
+
+    const usageRecord = asRecord(record.usage);
+    if (Object.keys(usageRecord).length > 0) {
+      usage = usageRecord;
+    }
+  }
+
+  const toolCalls = [...toolIdsByIndex.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([index, toolId]) => ({
+      id: toolId,
+      type: "function",
+      function: {
+        name: toolNamesByIndex.get(index) ?? `tool_${index}`,
+        arguments: toolArgsByIndex.get(index) ?? "",
+      },
+    }));
+
+  return {
+    id,
+    object: "chat.completion",
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: text,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: finishReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
+      },
+    ],
+    ...(usage ? { usage } : {}),
+  };
+}
+
 function parseResponsePayloadFromString(raw: string): Record<string, unknown> {
   const events = parseSseEvents(raw);
   let fallbackText = "";
@@ -1793,7 +1959,11 @@ function parseResponsePayloadFromString(raw: string): Record<string, unknown> {
 
 export function normalizeResponse(format: ApiFormat, body: unknown): NormalizedResponse {
   const payload =
-    format === "response" && typeof body === "string" ? parseResponsePayloadFromString(body) : asRecord(body);
+    format === "openai" && typeof body === "string"
+      ? parseOpenAIPayloadFromString(body)
+      : format === "response" && typeof body === "string"
+        ? parseResponsePayloadFromString(body)
+        : asRecord(body);
 
   switch (format) {
     case "claude": {
@@ -1909,12 +2079,18 @@ export function normalizeResponse(format: ApiFormat, body: unknown): NormalizedR
         }
 
         if (typeof record.type === "string" && record.type.endsWith("_call")) {
+          const parsedArguments =
+            typeof record.arguments === "string"
+              ? parseJsonObject(record.arguments)
+              : Object.keys(asRecord(record.action)).length > 0
+                ? asRecord(record.action)
+                : {};
           return [
             {
               type: "tool-call",
               id: asString(record.call_id) ?? asString(record.id) ?? "tool",
               name: asString(record.name) ?? normalizeBuiltInToolType(record.type),
-              arguments: parseJsonObject(record.arguments),
+              arguments: parsedArguments,
               toolType: normalizeBuiltInToolType(record.type),
               raw: record,
             } satisfies ToolCallBlock,
@@ -2381,45 +2557,60 @@ export function renderSyntheticStream(format: ApiFormat, response: NormalizedRes
           },
         })}\n\n`,
       ];
+      let nextIndex = 0;
       if (response.text) {
         lines.push(
           `event: content_block_start\ndata: ${JSON.stringify({
             type: "content_block_start",
-            index: 0,
+            index: nextIndex,
             content_block: { type: "text", text: "" },
           })}\n\n`
         );
         lines.push(
           `event: content_block_delta\ndata: ${JSON.stringify({
             type: "content_block_delta",
-            index: 0,
+            index: nextIndex,
             delta: { type: "text_delta", text: response.text },
           })}\n\n`
         );
         lines.push(
           `event: content_block_stop\ndata: ${JSON.stringify({
             type: "content_block_stop",
-            index: 0,
+            index: nextIndex,
           })}\n\n`
         );
+        nextIndex += 1;
       }
-      for (const [index, toolCall] of response.toolCalls.entries()) {
+      for (const toolCall of response.toolCalls) {
+        const toolIndex = nextIndex++;
         lines.push(
           `event: content_block_start\ndata: ${JSON.stringify({
             type: "content_block_start",
-            index: index + 1,
+            index: toolIndex,
             content_block: {
               type: "tool_use",
               id: toolCall.id,
               name: toolCall.name,
-              input: toolCall.arguments,
+              input: {},
             },
           })}\n\n`
         );
+        if (Object.keys(toolCall.arguments).length > 0) {
+          lines.push(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta",
+              index: toolIndex,
+              delta: {
+                type: "input_json_delta",
+                partial_json: JSON.stringify(toolCall.arguments),
+              },
+            })}\n\n`
+          );
+        }
         lines.push(
           `event: content_block_stop\ndata: ${JSON.stringify({
             type: "content_block_stop",
-            index: index + 1,
+            index: toolIndex,
           })}\n\n`
         );
       }

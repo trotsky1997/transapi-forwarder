@@ -161,6 +161,497 @@ models:
     expect(json.usage.output_tokens).toBe(4);
   });
 
+  test("buffers non-stream response upstream requests by requesting SSE", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-stream-buffered
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    let capturedBody: Record<string, unknown> = {};
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}',
+            '',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"done"}',
+            '',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.4","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}]}}',
+            '',
+          ].join("\n"),
+          {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-stream-buffered",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        }),
+      })
+    );
+
+    expect(capturedBody).toMatchObject({
+      model: "gpt-5.4",
+      stream: true,
+    });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      type: "message",
+      content: [{ text: "done" }],
+    });
+  });
+
+  test("renders Claude tool definitions in the Responses tool shape", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-tools-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    let capturedBody: Record<string, unknown> = {};
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            id: "resp_1",
+            object: "response",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                id: "msg_1",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "ok" }],
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-tools-via-claude",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          tools: [
+            {
+              name: "Read",
+              description: "Read a file",
+              input_schema: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                },
+                required: ["path"],
+              },
+            },
+          ],
+        }),
+      })
+    );
+
+    expect(capturedBody).toMatchObject({
+      model: "gpt-5.4",
+      stream: true,
+      tools: [
+        {
+          type: "function",
+          name: "Read",
+          description: "Read a file",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+            },
+            required: ["path"],
+          },
+        },
+      ],
+    });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      type: "message",
+      content: [{ text: "ok" }],
+    });
+  });
+
+  test("renders Claude built-in web_search tools in the Responses gateway shape", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-websearch-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    let capturedBody: Record<string, unknown> = {};
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            id: "resp_ws_1",
+            object: "response",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                id: "ws_1",
+                type: "web_search_call",
+                name: "web_search",
+                arguments: "{\"query\":\"anthropic.com\"}",
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-websearch-via-claude",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "Search the web" }] }],
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          tool_choice: { type: "web_search_20250305", name: "web_search" },
+        }),
+      })
+    );
+
+    expect(capturedBody).toMatchObject({
+      tools: [{ type: "web_search" }],
+      tool_choice: { type: "web_search" },
+    });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      content: [{ type: "tool_use", name: "web_search", input: { query: "anthropic.com" } }],
+    });
+  });
+
+  test("renders Claude built-in computer tools in the Responses gateway shape", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-computer-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    let capturedBody: Record<string, unknown> = {};
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            id: "resp_cmp_1",
+            object: "response",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                id: "fc_1",
+                type: "function_call",
+                call_id: "call_1",
+                name: "computer",
+                arguments: "{\"action\":\"screenshot\"}",
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-computer-via-claude",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "Take a screenshot" }] }],
+          tools: [
+            {
+              type: "computer_20250124",
+              name: "computer",
+              display_width_px: 1024,
+              display_height_px: 768,
+            },
+          ],
+          tool_choice: { type: "computer_20250124", name: "computer" },
+        }),
+      })
+    );
+
+    expect(capturedBody).toMatchObject({
+      tools: [
+        {
+          type: "function",
+          name: "computer",
+          parameters: { required: ["action"] },
+        },
+      ],
+      tool_choice: { type: "function", name: "computer" },
+    });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      content: [{ type: "tool_use", name: "computer", input: { action: "screenshot" } }],
+    });
+  });
+
+  test("buffers tool-bearing Claude stream requests into a synthetic claude stream with tool json deltas", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-stream-tools-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async () =>
+        new Response(
+          [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4"}}',
+            '',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","item":{"id":"fc_1","call_id":"call_1","type":"function_call","name":"Read","arguments":""}}',
+            '',
+            'event: response.function_call_arguments.delta',
+            'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"file_path\":\"package.json\"}"}',
+            '',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.4","output":[{"id":"fc_1","call_id":"call_1","type":"function_call","name":"Read","arguments":"{\\"file_path\\":\\"package.json\\"}"}]}}',
+            '',
+          ].join("\n"),
+          {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }
+        ),
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-stream-tools-via-claude",
+          stream: true,
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "Use Read on package.json" }] }],
+          tools: [
+            {
+              name: "Read",
+              input_schema: {
+                type: "object",
+                properties: {
+                  file_path: { type: "string" },
+                },
+                required: ["file_path"],
+              },
+            },
+          ],
+        }),
+      })
+    );
+
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const text = await response.text();
+    expect(text).toContain('"type":"tool_use"');
+    expect(text).toContain('"name":"Read"');
+    expect(text).toContain('"type":"input_json_delta"');
+    expect(text).toContain('"partial_json":"{\\"file_path\\":\\"package.json\\"}"');
+  });
+
+  test("retries Responses upstream requests after removing unsupported metadata while preserving tools", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: codex-metadata-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: response
+      apiKey:
+        mode: pass-through
+`);
+
+    const capturedBodies: Array<Record<string, unknown>> = [];
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+
+        if (capturedBodies.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "Unsupported parameter: metadata",
+                type: "invalid_request_error",
+              },
+            }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            id: "resp_1",
+            object: "response",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                id: "msg_1",
+                type: "message",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "ok" }],
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "codex-metadata-via-claude",
+          max_tokens: 64,
+          metadata: { session_id: "abc" },
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          tools: [
+            {
+              name: "Read",
+              description: "Read a file",
+              input_schema: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                },
+                required: ["path"],
+              },
+            },
+          ],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedBodies).toHaveLength(2);
+    expect(capturedBodies[0]).toMatchObject({
+      metadata: { session_id: "abc" },
+      tools: [
+        {
+          type: "function",
+          name: "Read",
+        },
+      ],
+    });
+    expect(capturedBodies[1].metadata).toBeUndefined();
+    expect(capturedBodies[1]).toMatchObject({
+      tools: [
+        {
+          type: "function",
+          name: "Read",
+        },
+      ],
+    });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      type: "message",
+      content: [{ text: "ok" }],
+    });
+  });
+
   test("maps Claude compaction requests onto Responses upstream compaction fields", async () => {
     const config = loadForwarderConfigFromYaml(`
 models:
@@ -699,7 +1190,7 @@ models:
     });
   });
 
-  test("rectifies response input strings before passthrough", async () => {
+  test("rectifies response input strings before buffered response forwarding", async () => {
     const config = loadForwarderConfigFromYaml(`
 models:
   - name: response-direct
@@ -738,9 +1229,10 @@ models:
       })
     );
 
-    expect(result.passthrough).toBe(true);
+    expect(result.passthrough).toBe(false);
     expect(capturedBody).toEqual({
       model: "gpt-5.1-codex",
+      stream: true,
       input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
     });
   });
@@ -1812,6 +2304,175 @@ models:
     });
   });
 
+  test("retries OpenAI upstream requests with max_completion_tokens when max_tokens is rejected", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: macaron-tools-via-claude
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: openai
+      apiKey:
+        mode: pass-through
+`);
+
+    const capturedBodies: Array<Record<string, unknown>> = [];
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+
+        if (capturedBodies.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead.",
+                type: "invalid_request_error",
+              },
+            }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            id: "chatcmpl_1",
+            object: "chat.completion",
+            model: "gpt-5.4",
+            choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "macaron-tools-via-claude",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          tools: [
+            {
+              name: "Read",
+              input_schema: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                },
+                required: ["path"],
+              },
+            },
+          ],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedBodies).toHaveLength(2);
+    expect(capturedBodies[0]).toMatchObject({
+      model: "gpt-5.4",
+      max_tokens: 64,
+    });
+    expect(capturedBodies[1]).toMatchObject({
+      model: "gpt-5.4",
+      max_completion_tokens: 64,
+    });
+    expect(capturedBodies[1].max_tokens).toBeUndefined();
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      type: "message",
+      content: [{ text: "ok" }],
+    });
+  });
+
+  test("retries OpenAI upstream requests with buffered streaming when the gateway requires stream true", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: macaron-stream-required
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: openai
+      apiKey:
+        mode: pass-through
+`);
+
+    const capturedBodies: Array<Record<string, unknown>> = [];
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+
+        if (capturedBodies.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "Stream must be set to true",
+                type: "invalid_request_error",
+              },
+            }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            }
+          );
+        }
+
+        return new Response(
+          [
+            'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+            '',
+            'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            '',
+            'data: [DONE]',
+            '',
+          ].join("\n"),
+          {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "macaron-stream-required",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedBodies).toHaveLength(2);
+    expect(capturedBodies[0]).toMatchObject({ stream: false });
+    expect(capturedBodies[1]).toMatchObject({ stream: true });
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      type: "message",
+      content: [{ text: "ok" }],
+    });
+  });
+
   test("buffers streamed response upstream back into non-stream OpenAI output when file preference is enabled", async () => {
     const config = loadForwarderConfigFromYaml(`
 models:
@@ -2651,6 +3312,51 @@ models:
         message: "Gemini multimodal embeddings cannot be converted to OpenAI /v1/embeddings",
         code: 501,
         status: "INTERNAL",
+      },
+    });
+  });
+
+  test("surfaces upstream detail strings when the upstream error body lacks message", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: openai-detail-error
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://cc.macaron.xin/openai/v1
+      format: openai
+      apiKey:
+        mode: pass-through
+`);
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async () =>
+        new Response(JSON.stringify({ detail: "tool schema rejected by upstream" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "openai-detail-error",
+          max_tokens: 64,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()) as Record<string, any>).toMatchObject({
+      error: {
+        message: "tool schema rejected by upstream",
+        type: "invalid_request_error",
       },
     });
   });

@@ -90,8 +90,35 @@ describe("transformStreamingResponse", () => {
     expect(text).toContain('"type":"thinking_delta"');
     expect(text).toContain('"type":"tool_use"');
     expect(text).toContain('"type":"input_json_delta"');
+    expect(text.match(/"type":"input_json_delta"/g)?.length).toBe(1);
     expect(text).toContain('"type":"text_delta"');
     expect(text).toContain("event: message_stop");
+  });
+
+  test("does not turn response message items into claude tool_use blocks", async () => {
+    const upstream = makeStreamResponse(
+      [
+        'event: response.created',
+        'data: {"response":{"id":"resp_msg_1","model":"gpt-5.4"}}',
+        '',
+        'event: response.output_item.added',
+        'data: {"item":{"id":"msg_1","type":"message","role":"assistant"}}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"item_id":"msg_1","delta":"hello"}',
+        '',
+        'event: response.completed',
+        'data: {"response":{"id":"resp_msg_1","object":"response","status":"completed","model":"gpt-5.4","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}]}}',
+        '',
+      ].join('\n')
+    );
+
+    const transformed = transformStreamingResponse("response", "claude", upstream, "claude-live");
+    const text = await transformed.text();
+
+    expect(text).toContain('"type":"text_delta"');
+    expect(text).not.toContain('"type":"tool_use"');
+    expect(text).not.toContain('"name":"message"');
   });
 
   test("maps claude compaction stream events to response compaction items", async () => {
@@ -289,6 +316,27 @@ describe("transformStreamingResponse", () => {
 
     expect(text).toContain('"type":"tool_use"');
     expect(text).toContain('"name":"web_search"');
+  });
+
+  test("maps response built-in web_search action objects to claude tool_use deltas", async () => {
+    const upstream = makeStreamResponse(
+      [
+        'data: {"type":"response.created","response":{"id":"resp_4b","model":"gpt-5.4"}}',
+        '',
+        'data: {"type":"response.output_item.added","item":{"id":"ws_2","type":"web_search_call","name":"web_search"}}',
+        '',
+        'data: {"type":"response.completed","response":{"id":"resp_4b","object":"response","status":"completed","model":"gpt-5.4","output":[{"id":"ws_2","type":"web_search_call","action":{"type":"search","query":"official Anthropic website","queries":["official Anthropic website"]}}]}}',
+        '',
+      ].join('\n')
+    );
+
+    const transformed = transformStreamingResponse("response", "claude", upstream, "claude-live");
+    const text = await transformed.text();
+
+    expect(text).toContain('"type":"tool_use"');
+    expect(text).toContain('"name":"web_search"');
+    expect(text).toContain('official Anthropic website');
+    expect(text).toContain('"type":"input_json_delta"');
   });
 
   test("maps response built-in tool output items such as computer_call to claude tool_use", async () => {

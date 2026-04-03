@@ -323,6 +323,7 @@ class ResponseApiStreamParser {
   private emittedToolIds = new Set<string>();
   private emittedToolArgumentIds = new Set<string>();
   private emittedCompactionKeys = new Set<string>();
+  private toolIdsByItemId = new Map<string, string>();
 
   consume(frame: SseFrame): StreamEvent[] {
     const parsed = parseJson(frame.data);
@@ -402,7 +403,14 @@ class ResponseApiStreamParser {
         }
         return events;
       }
-      const id = asString(item.call_id) ?? asString(item.id) ?? `tool_${Date.now()}`;
+      if (item.type !== "function_call" && !item.type.endsWith("_call")) {
+        return events;
+      }
+      const itemId = asString(item.id);
+      const id = asString(item.call_id) ?? itemId ?? `tool_${Date.now()}`;
+      if (itemId) {
+        this.toolIdsByItemId.set(itemId, id);
+      }
       const name = asString(item.name) ?? asString(item.type) ?? "tool";
       this.emittedToolIds.add(id);
       events.push({ type: "tool_call_start", id, name });
@@ -410,7 +418,8 @@ class ResponseApiStreamParser {
     }
 
     if (eventType === "response.function_call_arguments.delta") {
-      const id = asString(record.item_id) ?? `tool_${Date.now()}`;
+      const itemId = asString(record.item_id);
+      const id = (itemId ? this.toolIdsByItemId.get(itemId) : undefined) ?? itemId ?? `tool_${Date.now()}`;
       const delta = asString(record.delta);
       if (delta) {
         this.emittedToolArgumentIds.add(id);

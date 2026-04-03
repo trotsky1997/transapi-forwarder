@@ -608,7 +608,7 @@ type ErrorDetails = {
 
 function extractErrorDetails(raw: unknown): ErrorDetails {
   if (typeof raw === "string") {
-    return { message: raw };
+    return { message: raw || "Upstream request failed" };
   }
   if (raw && typeof raw === "object") {
     const record = raw as Record<string, unknown>;
@@ -627,8 +627,146 @@ function extractErrorDetails(raw: unknown): ErrorDetails {
         ...(typeof record.code === "string" ? { code: record.code } : {}),
       };
     }
+
+    if (typeof record.detail === "string") {
+      return {
+        message: record.detail,
+        ...(typeof record.type === "string" ? { type: record.type } : {}),
+        ...(typeof record.code === "string" ? { code: record.code } : {}),
+      };
+    }
+
+    const detail = record.detail as Record<string, unknown> | undefined;
+    if (typeof detail?.message === "string") {
+      return {
+        message: detail.message,
+        ...(typeof detail.type === "string" ? { type: detail.type } : {}),
+        ...(typeof detail.code === "string" ? { code: detail.code } : {}),
+      };
+    }
+
+    const serialized = JSON.stringify(record);
+    if (serialized && serialized !== "{}") {
+      return { message: serialized };
+    }
   }
   return { message: "Upstream request failed" };
+}
+
+function detectOpenAiMaxCompletionTokensRectifierTrigger(
+  message: string,
+  body: Record<string, unknown> | null
+): boolean {
+  if (!body || body.max_completion_tokens !== undefined || asNumber(body.max_tokens) === undefined) {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  if (normalized.includes("max_tokens") && normalized.includes("max_completion_tokens")) {
+    return true;
+  }
+
+  return (
+    normalized.includes("max_tokens") &&
+    (
+      normalized.includes("unsupported") ||
+      normalized.includes("unknown parameter") ||
+      normalized.includes("extra inputs are not permitted")
+    )
+  );
+}
+
+function rectifyOpenAiMaxCompletionTokens(body: Record<string, unknown> | null): boolean {
+  if (!body || body.max_completion_tokens !== undefined) {
+    return false;
+  }
+
+  const maxTokens = asNumber(body.max_tokens);
+  if (maxTokens === undefined) {
+    return false;
+  }
+
+  body.max_completion_tokens = maxTokens;
+  delete body.max_tokens;
+  return true;
+}
+
+function detectStreamRequiredRectifierTrigger(message: string, body: Record<string, unknown> | null): boolean {
+  if (!body || body.stream === true) {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  return normalized.includes("stream") && (
+    normalized.includes("must be set to true") ||
+    normalized.includes("must be true") ||
+    normalized.includes("requires stream") ||
+    normalized.includes("streaming only")
+  );
+}
+
+function rectifyBufferedStreamRequirement(upstreamRequest: BuiltUpstreamRequest): boolean {
+  if (upstreamRequest.passthrough || !upstreamRequest.renderedBody || upstreamRequest.renderedBody.stream === true) {
+    return false;
+  }
+
+  upstreamRequest.renderedBody.stream = true;
+  upstreamRequest.bufferedStreamResponse = true;
+  return true;
+}
+
+function extractUnsupportedParameterPath(message: string): string | undefined {
+  const match = message.match(/(?:unsupported|unknown) parameter:\s*['"]?([a-z0-9_.\[\]]+)['"]?/i);
+  return match?.[1];
+}
+
+function rectifyUnsupportedOptionalParameter(body: Record<string, unknown> | null, path: string): boolean {
+  if (!body) {
+    return false;
+  }
+
+  const topLevelField = path.split(/[.[]/, 1)[0] ?? path;
+  const supportedTopLevelOptionalFields = new Set([
+    "metadata",
+    "service_tier",
+    "truncation",
+    "store",
+    "parallel_tool_calls",
+    "reasoning",
+    "tool_choice",
+    "user",
+    "previous_response_id",
+  ]);
+
+  if (supportedTopLevelOptionalFields.has(topLevelField) && body[topLevelField] !== undefined) {
+    delete body[topLevelField];
+    return true;
+  }
+
+  const toolMatch = path.match(/^tools\[(\d+)\]\.(strict|description)$/);
+  if (toolMatch) {
+    const tool = asRecord(asArray(body.tools)[Number(toolMatch[1])]);
+    const field = toolMatch[2] as "strict" | "description";
+    if (tool[field] !== undefined) {
+      delete tool[field];
+      return true;
+    }
+    return false;
+  }
+
+  const openAiToolMatch = path.match(/^tools\[(\d+)\]\.function\.(strict|description)$/);
+  if (openAiToolMatch) {
+    const tool = asRecord(asArray(body.tools)[Number(openAiToolMatch[1])]);
+    const functionRecord = asRecord(tool.function);
+    const field = openAiToolMatch[2] as "strict" | "description";
+    if (functionRecord[field] !== undefined) {
+      delete functionRecord[field];
+      return true;
+    }
+    return false;
+  }
+
+  return false;
 }
 
 function buildErrorResponse(
@@ -727,6 +865,16 @@ function requestContainsCompaction(request: NormalizedRequest): boolean {
   );
 }
 
+function requestContainsTooling(request: NormalizedRequest): boolean {
+  return (
+    (request.tools?.length ?? 0) > 0 ||
+    request.toolChoice !== undefined ||
+    request.messages.some((message) =>
+      message.content.some((block) => block.type === "tool-call" || block.type === "tool-result")
+    )
+  );
+}
+
 function selectUpstreamFormat(
   endpoint: ReturnType<typeof detectEndpoint>,
   model: ModelConfig,
@@ -775,6 +923,14 @@ function shouldBufferResponseStream(
   request: NormalizedRequest,
   allowDirectStream: boolean
 ): boolean {
+  if (allowDirectStream && upstreamFormat === "response" && requestContainsTooling(request)) {
+    return true;
+  }
+
+  if (!allowDirectStream && upstreamFormat === "response" && model.upstream.format === "response") {
+    return true;
+  }
+
   if (!allowDirectStream && upstreamFormat === "response" && requestContainsCompaction(request)) {
     return true;
   }
@@ -1015,26 +1171,54 @@ async function fetchUpstreamWithRectifiers(
   const retryState = {
     thinkingBudgetRetried: false,
     thinkingSignatureRetried: false,
+    openAiMaxCompletionTokensRetried: false,
+    streamRequiredRetried: false,
+    unsupportedOptionalParametersRetried: new Set<string>(),
   };
 
   while (true) {
     const response = await send();
 
-    if (
-      upstreamRequest.upstreamFormat !== "claude" ||
-      !upstreamRequest.renderedBody ||
-      response.status !== 400
-    ) {
+    if (!upstreamRequest.renderedBody || response.status !== 400) {
       return response;
     }
 
     const error = await parseUpstreamError(response.clone());
 
+    const unsupportedParameterPath = extractUnsupportedParameterPath(error.message);
     if (
-      !retryState.thinkingBudgetRetried &&
-      detectThinkingBudgetRectifierTrigger(error.message) &&
-      rectifyThinkingBudget(upstreamRequest.renderedBody)
+      unsupportedParameterPath &&
+      !retryState.unsupportedOptionalParametersRetried.has(unsupportedParameterPath) &&
+      rectifyUnsupportedOptionalParameter(upstreamRequest.renderedBody, unsupportedParameterPath)
     ) {
+      retryState.unsupportedOptionalParametersRetried.add(unsupportedParameterPath);
+      continue;
+    }
+
+    if (
+      !retryState.streamRequiredRetried &&
+      detectStreamRequiredRectifierTrigger(error.message, upstreamRequest.renderedBody) &&
+      rectifyBufferedStreamRequirement(upstreamRequest)
+    ) {
+      retryState.streamRequiredRetried = true;
+      continue;
+    }
+
+    if (
+      upstreamRequest.upstreamFormat === "openai" &&
+      !retryState.openAiMaxCompletionTokensRetried &&
+      detectOpenAiMaxCompletionTokensRectifierTrigger(error.message, upstreamRequest.renderedBody) &&
+      rectifyOpenAiMaxCompletionTokens(upstreamRequest.renderedBody)
+    ) {
+      retryState.openAiMaxCompletionTokensRetried = true;
+      continue;
+    }
+
+    if (upstreamRequest.upstreamFormat !== "claude") {
+      return response;
+    }
+
+    if (!retryState.thinkingBudgetRetried && detectThinkingBudgetRectifierTrigger(error.message) && rectifyThinkingBudget(upstreamRequest.renderedBody)) {
       retryState.thinkingBudgetRetried = true;
       continue;
     }
@@ -1243,10 +1427,12 @@ export function createUniversalForwarder(options: CreateForwarderOptions): Unive
 
         return {
           passthrough: false,
-          response: new Response(JSON.stringify(renderResponse(endpoint.format, normalizedResponse)), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          }),
+          response: allowDirectStream
+            ? renderSyntheticStream(endpoint.format, normalizedResponse)
+            : new Response(JSON.stringify(renderResponse(endpoint.format, normalizedResponse)), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              }),
         };
       }
 
