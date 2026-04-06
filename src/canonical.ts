@@ -1610,7 +1610,6 @@ export function renderRequest(format: ApiFormat, request: NormalizedRequest): Re
           : {}),
         ...(request.tools ? { tools: renderOpenAITools(request.tools) } : {}),
         ...(request.toolChoice ? { tool_choice: renderOpenAIToolChoice(request.toolChoice) } : {}),
-        ...(request.metadata ? { metadata: request.metadata } : {}),
         ...(request.user ? { user: request.user } : {}),
         ...(request.parallelToolCalls !== undefined
           ? { parallel_tool_calls: request.parallelToolCalls }

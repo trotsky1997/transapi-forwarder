@@ -715,6 +715,27 @@ function rectifyBufferedStreamRequirement(upstreamRequest: BuiltUpstreamRequest)
   return true;
 }
 
+function detectStreamUnsupportedRectifierTrigger(message: string, body: Record<string, unknown> | null): boolean {
+  if (!body || body.stream !== true) {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  return normalized.includes("stream=true is not supported") ||
+    normalized.includes("stream true is not supported") ||
+    normalized.includes("streaming is not supported") ||
+    normalized.includes("stream is not supported");
+}
+
+function rectifyDisableUpstreamStream(upstreamRequest: BuiltUpstreamRequest): boolean {
+  if (upstreamRequest.passthrough || !upstreamRequest.renderedBody || upstreamRequest.renderedBody.stream !== true) {
+    return false;
+  }
+
+  upstreamRequest.renderedBody.stream = false;
+  return true;
+}
+
 function extractUnsupportedParameterPath(message: string): string | undefined {
   const match = message.match(/(?:unsupported|unknown) parameter:\s*['"]?([a-z0-9_.\[\]]+)['"]?/i);
   return match?.[1];
@@ -916,6 +937,40 @@ function selectCompactUpstreamFormat(model: ModelConfig): ApiFormat {
   throw new Error("Compaction is only supported for Responses/OpenAI-compatible upstreams");
 }
 
+function buildApproximateCountTokensRequestBody(
+  upstreamFormat: ApiFormat,
+  request: NormalizedRequest
+): Record<string, unknown> {
+  const countRequest: NormalizedRequest = {
+    ...request,
+    stream: false,
+    maxOutputTokens: Math.max(request.maxOutputTokens ?? 1, 1),
+  };
+
+  return renderRequest(upstreamFormat, countRequest);
+}
+
+function buildCountTokensResponse(format: ApiFormat, inputTokens: number): Response {
+  if (format === "claude") {
+    return new Response(JSON.stringify({ input_tokens: inputTokens }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (format === "gemini" || format === "gemini-cli") {
+    return new Response(JSON.stringify({ totalTokens: inputTokens }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify({ input_tokens: inputTokens }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function shouldBufferResponseStream(
   endpoint: ReturnType<typeof detectEndpoint>,
   model: ModelConfig,
@@ -1056,18 +1111,34 @@ function buildUpstreamRequest(
       };
     }
 
-    if (model.upstream.format !== "claude") {
-      throw new Error("Count tokens is only supported for Claude upstreams");
+    if (model.upstream.format === "claude") {
+      const upstreamUrl = new URL(
+        buildTargetUrl(model.upstream.baseUrl, buildUpstreamPath(model.upstream.format, model.upstream.model, "count_tokens"))
+      );
+      return {
+        upstreamUrl,
+        upstreamFormat: model.upstream.format,
+        bufferedStreamResponse: false,
+        renderedBody: renderCountTokensRequest(model.upstream.format, normalizedRequest),
+        normalizedRequest,
+        normalizedEmbeddingRequest: null,
+        passthrough: false,
+      };
     }
 
+    if (endpoint.format !== "claude") {
+      throw new Error("Cross-format count tokens is only supported for Claude downstreams");
+    }
+
+    const upstreamFormat = selectUpstreamFormat(endpoint, model, requestBody, normalizedRequest);
     const upstreamUrl = new URL(
-      buildTargetUrl(model.upstream.baseUrl, buildUpstreamPath(model.upstream.format, model.upstream.model, "count_tokens"))
+      buildTargetUrl(model.upstream.baseUrl, buildUpstreamPath(upstreamFormat, model.upstream.model, "generate"))
     );
     return {
       upstreamUrl,
-      upstreamFormat: model.upstream.format,
+      upstreamFormat,
       bufferedStreamResponse: false,
-      renderedBody: renderCountTokensRequest(model.upstream.format, normalizedRequest),
+      renderedBody: buildApproximateCountTokensRequestBody(upstreamFormat, normalizedRequest),
       normalizedRequest,
       normalizedEmbeddingRequest: null,
       passthrough: false,
@@ -1199,6 +1270,15 @@ async function fetchUpstreamWithRectifiers(
       !retryState.streamRequiredRetried &&
       detectStreamRequiredRectifierTrigger(error.message, upstreamRequest.renderedBody) &&
       rectifyBufferedStreamRequirement(upstreamRequest)
+    ) {
+      retryState.streamRequiredRetried = true;
+      continue;
+    }
+
+    if (
+      !retryState.streamRequiredRetried &&
+      detectStreamUnsupportedRectifierTrigger(error.message, upstreamRequest.renderedBody) &&
+      rectifyDisableUpstreamStream(upstreamRequest)
     ) {
       retryState.streamRequiredRetried = true;
       continue;
@@ -1404,7 +1484,9 @@ export function createUniversalForwarder(options: CreateForwarderOptions): Unive
       }
 
       if (endpoint.operation === "count_tokens") {
-        return { passthrough: false, response: upstreamResponse };
+        if (upstreamRequest.upstreamFormat === "claude" || upstreamRequest.upstreamFormat === "gemini" || upstreamRequest.upstreamFormat === "gemini-cli") {
+          return { passthrough: false, response: upstreamResponse };
+        }
       }
 
       if (!upstreamResponse.ok) {
@@ -1415,6 +1497,16 @@ export function createUniversalForwarder(options: CreateForwarderOptions): Unive
             type: error.type,
             code: error.code,
           }),
+        };
+      }
+
+      if (endpoint.operation === "count_tokens") {
+        const upstreamJson = await upstreamResponse.json();
+        const normalizedResponse = normalizeResponse(upstreamRequest.upstreamFormat, upstreamJson);
+        const inputTokens = normalizedResponse.usage?.inputTokens ?? normalizedResponse.usage?.totalTokens ?? 0;
+        return {
+          passthrough: false,
+          response: buildCountTokensResponse(endpoint.format, inputTokens),
         };
       }
 

@@ -1096,6 +1096,76 @@ models:
     expect(await response.json()).toEqual({ input_tokens: 42 });
   });
 
+  test("supports claude count_tokens for openai-compatible upstreams via usage fallback", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: claude-via-openai-count
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://mint-cn.macaron.xin/oai/api/v1
+      format: openai
+      apiKey:
+        mode: pass-through
+`);
+
+    let capturedUrl = "";
+    let capturedBody: Record<string, unknown> = {};
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (input, init) => {
+        capturedUrl = String(input);
+        capturedBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            id: "chatcmpl_count_1",
+            object: "chat.completion",
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                finish_reason: "stop",
+                message: { role: "assistant", content: "ok" },
+              },
+            ],
+            usage: { prompt_tokens: 37, completion_tokens: 1, total_tokens: 38 },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages/count_tokens", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-via-openai-count",
+          system: "Be exact",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      })
+    );
+
+    expect(capturedUrl).toBe("https://mint-cn.macaron.xin/oai/api/v1/chat/completions");
+    expect(capturedBody).toMatchObject({
+      model: "gpt-5.4",
+      stream: false,
+      max_tokens: 1,
+      messages: [
+        { role: "system", content: "Be exact" },
+        { role: "user", content: "hello" },
+      ],
+    });
+    expect(await response.json()).toEqual({ input_tokens: 37 });
+  });
+
   test("preserves claude compaction count_tokens fields and beta header", async () => {
     const config = loadForwarderConfigFromYaml(`
 models:
@@ -2471,6 +2541,88 @@ models:
       type: "message",
       content: [{ text: "ok" }],
     });
+  });
+
+  test("retries OpenAI upstream requests without streaming when the gateway rejects stream true", async () => {
+    const config = loadForwarderConfigFromYaml(`
+models:
+  - name: macaron-stream-unsupported
+    upstream:
+      model: gpt-5.4
+      baseUrl: https://mint-cn.macaron.xin/oai/api/v1
+      format: openai
+      apiKey:
+        mode: pass-through
+`);
+
+    const capturedBodies: Array<Record<string, unknown>> = [];
+
+    const forwarder = createUniversalForwarder({
+      config,
+      fetch: async (_input, init) => {
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+
+        if (capturedBodies.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "stream=True is not supported",
+                type: "invalid_request_error",
+              },
+            }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            id: "chatcmpl_1",
+            object: "chat.completion",
+            model: "gpt-5.4",
+            choices: [
+              {
+                index: 0,
+                finish_reason: "stop",
+                message: { role: "assistant", content: "ok" },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        );
+      },
+    });
+
+    const response = await forwarder.handle(
+      new Request("https://forwarder.local/v1/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer downstream-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "macaron-stream-unsupported",
+          max_tokens: 64,
+          stream: true,
+          messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedBodies).toHaveLength(2);
+    expect(capturedBodies[0]).toMatchObject({ stream: true });
+    expect(capturedBodies[1]).toMatchObject({ stream: false });
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const body = await response.text();
+    expect(body).toContain('event: message_start');
+    expect(body).toContain('"text":"ok"');
   });
 
   test("buffers streamed response upstream back into non-stream OpenAI output when file preference is enabled", async () => {
